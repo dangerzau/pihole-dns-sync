@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# VSCode or JetBrains IDE settings (optional, safe)
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# GitHub workflows temp files
+.github/*.tmp
+
+# Other
+.env
