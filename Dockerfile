@@ -1,9 +1,16 @@
-FROM python:3.12-slim
+FROM python:3.12
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libffi-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY app.py .
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN pip install docker requests prometheus_client
+COPY . .
 
 CMD ["python", "app.py"]

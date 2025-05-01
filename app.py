@@ -1,120 +1,156 @@
 import os
+import json
+import ipaddress
 import docker
 import requests
-import time
-from prometheus_client import start_http_server, Counter
-from flask import Flask
-from flask_healthcheck import HealthCheck
 
-# Environment Variables
-PIHOLE_URL = os.getenv('PIHOLE_URL', 'http://192.168.1.10')
-PIHOLE_TOKEN = os.getenv('PIHOLE_TOKEN')
-TRAEFIK_WATCH = os.getenv('TRAEFIK_WATCH', 'true').lower() == 'true'
-TARGET = os.getenv('TARGET')
-DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'
-HEALTHCHECK_PORT = int(os.getenv('HEALTHCHECK_PORT', 8000))
+# Environment variables
+PIHOLE_URL = os.getenv("PIHOLE_URL")
+PIHOLE_PASSWORD = os.getenv("PIHOLE_PASSWORD")
+DEFAULT_DNS_TARGET = os.getenv("DEFAULT_DNS_TARGET")
 
 # Docker client
-client = docker.from_env()
+docker_client = docker.from_env()
 
-# Prometheus metrics
-record_created = Counter('pihole_dns_record_created', 'Total records created')
-record_deleted = Counter('pihole_dns_record_deleted', 'Total records deleted')
-
-# Flask app for healthcheck
-app = Flask(__name__)
-health = HealthCheck()
-
-def get_pihole_api_url():
-    # Ensure PIHOLE_URL is either a full URL or IP address
-    if PIHOLE_URL.startswith('http'):
-        return PIHOLE_URL
-    return f'http://{PIHOLE_URL}/admin/api.php'
-
-def pihole_api_call(url, params):
-    headers = {
-        'Authorization': f'Bearer {PIHOLE_TOKEN}'
-    }
-    response = requests.get(url, params=params, headers=headers)
-    response.raise_for_status()
-    return response.json()
-
-def create_record(hostname, target):
-    url = get_pihole_api_url()
-    record_type = 'A' if target.count('.') == 3 else 'CNAME'
-    params = {
-        'host': hostname,
-        'type': record_type,
-        'content': target,
-        'token': PIHOLE_TOKEN
-    }
-    if DRY_RUN:
-        print(f"DRY-RUN: Would create {record_type} record for {hostname} pointing to {target}")
-        return
+def get_session_id():
+    """Authenticate with Pi-hole and retrieve the session ID."""
+    url = f"{PIHOLE_URL}/auth"
+    payload = {"password": PIHOLE_PASSWORD}
     try:
-        result = pihole_api_call(url, params)
-        if result.get('status') == 'ok':
-            record_created.inc()
-            print(f"Created {record_type} record: {hostname} -> {target}")
+        print("[INFO] Authenticating with Pi-hole API to retrieve session ID...")
+        response = requests.post(url, json=payload, verify=False)
+        if response.status_code == 200:
+            data = response.json()
+            sid = data["session"]["sid"]
+            print(f"[INFO] Successfully authenticated. Session ID: {sid}")
+            return sid
         else:
-            print(f"Failed to create {record_type} record for {hostname}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error creating record: {e}")
+            print(f"[ERROR] Failed to authenticate. Status: {response.status_code}, Body: {response.text}")
+            return None
+    except Exception as e:
+        print(f"[ERROR] Exception during authentication: {e}")
+        return None
 
-def delete_record(hostname):
-    url = get_pihole_api_url()
-    params = {
-        'host': hostname,
-        'token': PIHOLE_TOKEN
-    }
-    if DRY_RUN:
-        print(f"DRY-RUN: Would delete record for {hostname}")
-        return
+def is_ip(address):
+    """Check if the given address is a valid IP."""
     try:
-        result = pihole_api_call(url, params)
-        if result.get('status') == 'ok':
-            record_deleted.inc()
-            print(f"Deleted record for {hostname}")
-        else:
-            print(f"Failed to delete record for {hostname}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error deleting record: {e}")
+        ipaddress.ip_address(address)
+        return True
+    except ValueError:
+        return False
 
-def handle_container_event(event):
-    container = event['actor']['Attributes']
-    container_name = container.get('name')
-    if container_name is None:
-        return
+def parse_custom_records(container):
+    """Parse DNS records from container labels or fallback to default logic."""
+    labels = container.labels or {}
+    records = []
 
-    print(f"Handling event for container: {container_name} - {event['Action']}")
-
-    if TRAEFIK_WATCH:
-        traefik_host = container.get('traefik.http.routers.myrouter.rule', None)
-        if traefik_host:
-            hostname = traefik_host.split('Host(')[-1].split(')')[0]
-            target = TARGET if TARGET else container.get('IP')
-            if event['Action'] == 'start':
-                create_record(hostname, target)
-            elif event['Action'] == 'stop':
-                delete_record(hostname)
+    # Check for pihole.custom-record label
+    if "pihole.custom-record" in labels:
+        print(f"[DEBUG] Found pihole.custom-record: {labels['pihole.custom-record']}")
+        try:
+            entries = json.loads(labels["pihole.custom-record"].replace("'", '"'))
+            for pair in entries:
+                if len(pair) == 2:
+                    records.append((pair[0], pair[1]))
+            print(f"[DEBUG] Parsed Records: {records}")
+        except Exception as e:
+            print(f"[ERROR] Failed to parse pihole.custom-record for container {container.name}: {e}")
     else:
-        container_host = container.get('CONTAINER_HOST')
-        target_host = container.get('TARGET_HOST')
-        if container_host and target_host:
-            if event['Action'] == 'start':
-                create_record(container_host, target_host)
-            elif event['Action'] == 'stop':
-                delete_record(container_host)
+        # Fall back to extracting source from Traefik host rules
+        default_target = DEFAULT_DNS_TARGET
+        if not default_target:
+            print("[ERROR] DEFAULT_DNS_TARGET environment variable is not set. Skipping container.")
+            return None
+        
+        for key, value in labels.items():
+            if key.startswith("traefik.http.routers.") and ".rule" in key and "Host(`" in value:
+                # Extract hostname from Traefik rule: Host(`example.com`) -> example.com
+                source = value.split("Host(`")[1].split("`)")[0]
+                records.append((source, default_target))
+                print(f"[INFO] Using Traefik host rule: {source} -> {default_target}")
+    return records if records else None
 
-def container_event_listener():
-    for event in client.events(decode=True):
-        handle_container_event(event)
+def add_record(name, target, session_id):
+    """Add a DNS record to Pi-hole."""
+    endpoint = f"{PIHOLE_URL}/config/dns%2Fhosts/{target}%20{name}" if is_ip(target) else f"{PIHOLE_URL}/config/dns%2FcnameRecords/{name}%2C{target}"
+    headers = {
+        "X-FTL-SID": session_id,
+        "accept": "application/json"
+    }
+    try:
+        print(f"[INFO] Sending request to Pi-hole to add DNS record ({name} -> {target})")
+        res = requests.put(endpoint, headers=headers)
+        print(f"[DEBUG] Pi-hole Response: Status={res.status_code}, Body={res.text}")
+        if res.status_code == 200:
+            print(f"[INFO] Pi-hole API: DNS record added successfully ({name} -> {target})")
+        elif res.status_code == 409:
+            print(f"[INFO] Pi-hole API: DNS record already exists ({name} -> {target})")
+        else:
+            print(f"[ERROR] Pi-hole API: Failed to add DNS record ({name} -> {target}): {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception during Pi-hole API call for DNS record ({name} -> {target}): {e}")
 
-@app.route("/health", methods=["GET"])
-def healthcheck():
-    return "OK", 200
+def delete_record(name, target, session_id):
+    """Delete a DNS record from Pi-hole."""
+    endpoint = f"{PIHOLE_URL}/config/dns%2Fhosts/{target}%20{name}" if is_ip(target) else f"{PIHOLE_URL}/config/dns%2FcnameRecords/{name}%2C{target}"
+    headers = {
+        "X-FTL-SID": session_id,
+        "accept": "application/json"
+    }
+    try:
+        print(f"[INFO] Sending request to Pi-hole to delete DNS record ({name} -> {target})")
+        res = requests.delete(endpoint, headers=headers)
+        print(f"[DEBUG] Pi-hole Response: Status={res.status_code}, Body={res.text}")
+        if res.status_code == 204:
+            print(f"[INFO] Pi-hole API: DNS record deleted successfully ({name} -> {target})")
+        elif res.status_code == 404:
+            print(f"[INFO] Pi-hole API: DNS record not found ({name} -> {target}). Nothing to delete.")
+        else:
+            print(f"[ERROR] Pi-hole API: Failed to delete DNS record ({name} -> {target}): {res.status_code} {res.text}")
+    except Exception as e:
+        print(f"[ERROR] Exception during Pi-hole API call to delete DNS record ({name} -> {target}): {e}")
+
+def monitor_events(session_id):
+    """Monitor Docker events and process containers with or without 'pihole.custom-record'."""
+    print("[INFO] Monitoring Docker events for containers with piholeup=yes label...")
+    try:
+        for event in docker_client.events(decode=True):
+            if event.get("Type") == "container" and event.get("status") == "start":
+                cid = event.get("id")
+                try:
+                    container = docker_client.containers.get(cid)
+                    records = parse_custom_records(container)
+                    if records:
+                        print(f"[INFO] Found piholeup=yes label on container {cid}. Processing DNS records...")
+                        for name, target in records:
+                            add_record(name, target, session_id)
+                except docker.errors.NotFound:
+                    continue
+                except Exception as e:
+                    print(f"[ERROR] Failed to process container {cid}: {e}")
+            elif event.get("Type") == "container" and event.get("status") == "stop":
+                cid = event.get("id")
+                try:
+                    container = docker_client.containers.get(cid)
+                    records = parse_custom_records(container)
+                    if records:
+                        print(f"[INFO] Found piholeup=yes label on stopped container {cid}. Removing DNS records...")
+                        for name, target in records:
+                            delete_record(name, target, session_id)
+                except docker.errors.NotFound:
+                    continue
+                except Exception as e:
+                    print(f"[ERROR] Failed to process stopped container {cid}: {e}")
+    except Exception as e:
+        print(f"[ERROR] Docker event monitoring encountered an error: {e}")
+
+def main():
+    print("[INFO] Starting pihole-dns-sync...")
+    session_id = get_session_id()
+    if not session_id:
+        print("[ERROR] Unable to retrieve session ID. Exiting...")
+        return
+    monitor_events(session_id)
 
 if __name__ == "__main__":
-    start_http_server(HEALTHCHECK_PORT)
-    app.run(host='0.0.0.0', port=HEALTHCHECK_PORT, debug=False)
-    container_event_listener()
+    main()

@@ -1,18 +1,19 @@
-version: '3.9'
-
 services:
   pihole-dns-sync:
-    image: ghcr.io/dangerzau/pihole-dns-sync:latest
-    build: .
+    build:
+      context: .  # Current directory where Dockerfile is located
+      dockerfile: Dockerfile  # Explicitly specify the Dockerfile (optional if named 'Dockerfile')
     container_name: pihole-dns-sync
-    restart: unless-stopped
     environment:
-      - PIHOLE_URL=http://192.168.50.212
-      - PIHOLE_TOKEN=NbxTO907wg0MFSqS/leFXxEzB3mTigbLnTqs2magb1U=
+      # - DOCKER_HOST=unix:///var/run/docker.sock
+      - PYTHONUNBUFFERED=1
+      - DEBUG=false
+      - DEFAULT_DNS_TARGET=jf.jimmyc.net
+      - PIHOLE_URL=http://pihole/api
+      - PIHOLE_PASSWORD=9mh/OrCmBZa+A1s+ct/yODMwoQR3t/HorETu5Yz1lyg=
       - TRAEFIK_WATCH=true
-      - TARGET=192.168.1.100
-      - DRY_RUN=false
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
     ports:
-      - 8000:8000
+      - "8000:8000"  # Exposes port 8000 to the host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # To interact with Docker API
+    restart: no
