@@ -3,6 +3,14 @@ import json
 import ipaddress
 import docker
 import requests
+import time
+import logging
+import signal
+from typing import Optional, List, Tuple
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 # Environment variables
 PIHOLE_URL = os.getenv("PIHOLE_URL")
@@ -12,26 +20,53 @@ DEFAULT_DNS_TARGET = os.getenv("DEFAULT_DNS_TARGET")
 # Docker client
 docker_client = docker.from_env()
 
-def get_session_id():
-    """Authenticate with Pi-hole and retrieve the session ID."""
-    url = f"{PIHOLE_URL}/auth"
-    payload = {"password": PIHOLE_PASSWORD}
-    try:
-        print("[INFO] Authenticating with Pi-hole API to retrieve session ID...")
-        response = requests.post(url, json=payload, verify=False)
-        if response.status_code == 200:
-            data = response.json()
-            sid = data["session"]["sid"]
-            print(f"[INFO] Successfully authenticated. Session ID: {sid}")
-            return sid
-        else:
-            print(f"[ERROR] Failed to authenticate. Status: {response.status_code}, Body: {response.text}")
-            return None
-    except Exception as e:
-        print(f"[ERROR] Exception during authentication: {e}")
-        return None
+# Constants for retry logic
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
+RETRY_DELAY = int(os.getenv("RETRY_DELAY", 5))  # in seconds
 
-def is_ip(address):
+# Global flag to control event monitoring
+stop_event_monitoring = False
+
+# Validate environment variables
+if not PIHOLE_URL or not PIHOLE_PASSWORD:
+    logger.error("PIHOLE_URL and PIHOLE_PASSWORD environment variables must be set.")
+    exit(1)
+
+if not DEFAULT_DNS_TARGET:
+    logger.warning("DEFAULT_DNS_TARGET environment variable is not set. Some containers may be skipped.")
+
+# At the top of your file
+processed_records = set()
+
+def get_session_id() -> Optional[str]:
+    """Authenticate with Pi-hole and retrieve the session ID."""
+    url = f"{PIHOLE_URL.rstrip('/')}/auth"
+    payload = {"password": PIHOLE_PASSWORD}
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info("Authenticating with Pi-hole API to retrieve session ID...")
+            response = requests.post(url, json=payload, verify=False)
+            if response.status_code == 200:
+                sid = response.json().get("session", {}).get("sid")
+                if sid:
+                    logger.info(f"Successfully authenticated. Session ID: {sid}")
+                    return sid
+            elif response.status_code == 401:
+                logger.error("Authentication failed: Unauthorized. Check Pi-hole password.")
+                return None
+            else:
+                handle_api_response(response, "Authentication")
+        except requests.RequestException as e:
+            logger.error(f"Exception during authentication: {e}")
+            if attempt < MAX_RETRIES - 1:
+                logger.info(f"Retrying authentication... (Attempt {attempt + 1} of {MAX_RETRIES})")
+                time.sleep(RETRY_DELAY)
+    logger.error("Authentication failed after multiple attempts.")
+    return None
+
+
+def is_ip(address: str) -> bool:
     """Check if the given address is a valid IP."""
     try:
         ipaddress.ip_address(address)
@@ -39,118 +74,174 @@ def is_ip(address):
     except ValueError:
         return False
 
-def parse_custom_records(container):
+
+def parse_custom_records(container) -> Optional[List[Tuple[str, str]]]:
     """Parse DNS records from container labels or fallback to default logic."""
     labels = container.labels or {}
     records = []
 
-    # Check for pihole.custom-record label
     if "pihole.custom-record" in labels:
-        print(f"[DEBUG] Found pihole.custom-record: {labels['pihole.custom-record']}")
+        logger.debug(f"Found pihole.custom-record: {labels['pihole.custom-record']}")
         try:
             entries = json.loads(labels["pihole.custom-record"].replace("'", '"'))
-            for pair in entries:
-                if len(pair) == 2:
-                    records.append((pair[0], pair[1]))
-            print(f"[DEBUG] Parsed Records: {records}")
+            records = [(pair[0], pair[1]) for pair in entries if len(pair) == 2]
+            logger.debug(f"Parsed Records: {records}")
         except Exception as e:
-            print(f"[ERROR] Failed to parse pihole.custom-record for container {container.name}: {e}")
+            logger.error(f"Failed to parse pihole.custom-record for container {container.name}: {e}")
     else:
-        # Fall back to extracting source from Traefik host rules
-        default_target = DEFAULT_DNS_TARGET
-        if not default_target:
-            print("[ERROR] DEFAULT_DNS_TARGET environment variable is not set. Skipping container.")
+        if not DEFAULT_DNS_TARGET:
+            logger.error("DEFAULT_DNS_TARGET environment variable is not set. Skipping container.")
             return None
-        
+
         for key, value in labels.items():
             if key.startswith("traefik.http.routers.") and ".rule" in key and "Host(`" in value:
-                # Extract hostname from Traefik rule: Host(`example.com`) -> example.com
                 source = value.split("Host(`")[1].split("`)")[0]
-                records.append((source, default_target))
-                print(f"[INFO] Using Traefik host rule: {source} -> {default_target}")
+                records.append((source, DEFAULT_DNS_TARGET))
+                logger.info(f"Using Traefik host rule: {source} -> {DEFAULT_DNS_TARGET}")
+
+    # After collecting records
+    # Remove duplicates
+    records = list(set(records))
     return records if records else None
 
-def add_record(name, target, session_id):
-    """Add a DNS record to Pi-hole."""
-    endpoint = f"{PIHOLE_URL}/config/dns%2Fhosts/{target}%20{name}" if is_ip(target) else f"{PIHOLE_URL}/config/dns%2FcnameRecords/{name}%2C{target}"
-    headers = {
-        "X-FTL-SID": session_id,
-        "accept": "application/json"
-    }
-    try:
-        print(f"[INFO] Sending request to Pi-hole to add DNS record ({name} -> {target})")
-        res = requests.put(endpoint, headers=headers)
-        print(f"[DEBUG] Pi-hole Response: Status={res.status_code}, Body={res.text}")
-        if res.status_code == 200:
-            print(f"[INFO] Pi-hole API: DNS record added successfully ({name} -> {target})")
-        elif res.status_code == 409:
-            print(f"[INFO] Pi-hole API: DNS record already exists ({name} -> {target})")
-        else:
-            print(f"[ERROR] Pi-hole API: Failed to add DNS record ({name} -> {target}): {res.status_code} {res.text}")
-    except Exception as e:
-        print(f"[ERROR] Exception during Pi-hole API call for DNS record ({name} -> {target}): {e}")
 
-def delete_record(name, target, session_id):
+def send_request(method: str, endpoint: str, headers: dict) -> Optional[requests.Response]:
+    """Send a request to the Pi-hole API with retry logic and handle responses."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            logger.info(f"Sending {method.upper()} request to Pi-hole: {endpoint}")
+            response = requests.request(method, endpoint, headers=headers)
+            if response.status_code in [200, 201, 204]:
+                logger.info(f"{method.upper()} request to {endpoint} succeeded. Status: {response.status_code}")
+                return response  # Exit the loop on success
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", RETRY_DELAY))
+                logger.warning(f"Rate limit exceeded. Retrying after {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
+            else:
+                # Only handle non-successful responses
+                handle_api_response(response, f"{method.upper()} request to {endpoint}")
+        except requests.RequestException as e:
+            logger.error(f"Exception during Pi-hole API call: {e}")
+            backoff = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+            if attempt < MAX_RETRIES - 1:
+                logger.info(f"Retrying... (Attempt {attempt + 1} of {MAX_RETRIES}) after {backoff} seconds")
+                time.sleep(backoff)
+    logger.error(f"Failed to complete {method.upper()} request after {MAX_RETRIES} attempts.")
+    return None
+
+
+def handle_api_response(response: requests.Response, action: str) -> bool:
+    """Handle API responses and log appropriate messages based on status codes."""
+    if response.status_code in [200, 201, 204]:
+        logger.info(f"{action} succeeded. Status: {response.status_code}")
+        return True
+    elif response.status_code == 400:
+        logger.error(f"{action} failed: Bad Request. Check parameters. Status: {response.status_code}")
+    elif response.status_code == 401:
+        logger.error(f"{action} failed: Unauthorized. Missing or invalid session ID. Status: {response.status_code}")
+    elif response.status_code == 403:
+        logger.error(f"{action} failed: Forbidden. API key lacks permissions. Status: {response.status_code}")
+    elif response.status_code == 404:
+        logger.error(f"{action} failed: Not Found. Resource does not exist. Status: {response.status_code}")
+    elif response.status_code == 429:
+        logger.error(f"{action} failed: Too Many Requests. Rate limit exceeded. Status: {response.status_code}")
+    elif response.status_code >= 500:
+        logger.error(f"{action} failed: Server error on Pi-hole's end. Status: {response.status_code}")
+    else:
+        logger.error(f"{action} failed: Unexpected error. Status: {response.status_code}, Body: {response.text}")
+    return False
+
+
+def construct_endpoint(name: str, target: str, action: str) -> str:
+    if action == "add" or action == "delete":
+        if is_ip(target):
+            return f"{PIHOLE_URL}config/dns/hosts/{target} {name}"
+        else:
+            return f"{PIHOLE_URL}config/dns%2FcnameRecords/{name}%2C{target}"
+    raise ValueError(f"Invalid action '{action}' specified for endpoint construction.")
+
+
+def add_record(name: str, target: str, session_id: str) -> None:
+    key = (name, target)
+    if key in processed_records:
+        logger.info(f"Record {key} already processed, skipping.")
+        return
+    endpoint = construct_endpoint(name, target, "add")
+    headers = {"X-FTL-SID": session_id, "accept": "application/json"}
+    response = send_request("put", endpoint, headers)
+    if response:
+        processed_records.add(key)
+    else:
+        logger.error(f"Failed to add DNS record ({name} -> {target}) after retries.")
+
+
+def delete_record(name: str, target: str, session_id: str) -> None:
     """Delete a DNS record from Pi-hole."""
-    endpoint = f"{PIHOLE_URL}/config/dns%2Fhosts/{target}%20{name}" if is_ip(target) else f"{PIHOLE_URL}/config/dns%2FcnameRecords/{name}%2C{target}"
-    headers = {
-        "X-FTL-SID": session_id,
-        "accept": "application/json"
-    }
-    try:
-        print(f"[INFO] Sending request to Pi-hole to delete DNS record ({name} -> {target})")
-        res = requests.delete(endpoint, headers=headers)
-        print(f"[DEBUG] Pi-hole Response: Status={res.status_code}, Body={res.text}")
-        if res.status_code == 204:
-            print(f"[INFO] Pi-hole API: DNS record deleted successfully ({name} -> {target})")
-        elif res.status_code == 404:
-            print(f"[INFO] Pi-hole API: DNS record not found ({name} -> {target}). Nothing to delete.")
-        else:
-            print(f"[ERROR] Pi-hole API: Failed to delete DNS record ({name} -> {target}): {res.status_code} {res.text}")
-    except Exception as e:
-        print(f"[ERROR] Exception during Pi-hole API call to delete DNS record ({name} -> {target}): {e}")
+    key = (name, target)
+    endpoint = construct_endpoint(name, target, "delete")
+    headers = {"X-FTL-SID": session_id, "accept": "application/json"}
+    response = send_request("delete", endpoint, headers)
+    if response:
+        # Remove from processed_records so it can be re-added later
+        processed_records.discard(key)
+    else:
+        logger.error(f"Failed to delete DNS record ({name} -> {target}) after retries.")
 
-def monitor_events(session_id):
+
+def signal_handler(sig, frame):
+    """Handle termination signals to gracefully stop event monitoring."""
+    global stop_event_monitoring
+    logger.info("Termination signal received. Stopping event monitoring...")
+    stop_event_monitoring = True
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def monitor_events(session_id: str) -> None:
     """Monitor Docker events and process containers with or without 'pihole.custom-record'."""
-    print("[INFO] Monitoring Docker events for containers with piholeup=yes label...")
+    global stop_event_monitoring
+    logger.info("Monitoring Docker events for containers with piholeup=yes label...")
     try:
-        for event in docker_client.events(decode=True):
-            if event.get("Type") == "container" and event.get("status") == "start":
+        event_filters = {"event": ["start", "stop"]}
+        for event in docker_client.events(decode=True, filters=event_filters):
+            if stop_event_monitoring:
+                logger.info("Stopping Docker event monitoring...")
+                break
+            if event.get("Type") == "container":
                 cid = event.get("id")
+                status = event.get("status")
                 try:
                     container = docker_client.containers.get(cid)
+                    container_name = container.name  # Human-readable container name
                     records = parse_custom_records(container)
                     if records:
-                        print(f"[INFO] Found piholeup=yes label on container {cid}. Processing DNS records...")
-                        for name, target in records:
-                            add_record(name, target, session_id)
+                        if status == "start":
+                            logger.info(f"Processing DNS records for started container '{container_name}' (ID: {cid})...")
+                            for name, target in records:
+                                add_record(name, target, session_id)
+                        elif status == "stop":
+                            logger.info(f"Removing DNS records for stopped container '{container_name}' (ID: {cid})...")
+                            for name, target in records:
+                                delete_record(name, target, session_id)
                 except docker.errors.NotFound:
-                    continue
+                    logger.warning(f"Container with ID '{cid}' not found. Skipping...")
                 except Exception as e:
-                    print(f"[ERROR] Failed to process container {cid}: {e}")
-            elif event.get("Type") == "container" and event.get("status") == "stop":
-                cid = event.get("id")
-                try:
-                    container = docker_client.containers.get(cid)
-                    records = parse_custom_records(container)
-                    if records:
-                        print(f"[INFO] Found piholeup=yes label on stopped container {cid}. Removing DNS records...")
-                        for name, target in records:
-                            delete_record(name, target, session_id)
-                except docker.errors.NotFound:
-                    continue
-                except Exception as e:
-                    print(f"[ERROR] Failed to process stopped container {cid}: {e}")
+                    logger.error(f"Failed to process container '{container_name}' (ID: {cid}): {e}")
     except Exception as e:
-        print(f"[ERROR] Docker event monitoring encountered an error: {e}")
+        logger.error(f"Docker event monitoring encountered an error: {e}")
 
-def main():
-    print("[INFO] Starting pihole-dns-sync...")
+
+def main() -> None:
+    logger.info("Starting pihole-dns-sync...")
     session_id = get_session_id()
     if not session_id:
-        print("[ERROR] Unable to retrieve session ID. Exiting...")
+        logger.error("Unable to retrieve session ID. Exiting...")
         return
     monitor_events(session_id)
+
 
 if __name__ == "__main__":
     main()
