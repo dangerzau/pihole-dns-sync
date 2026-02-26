@@ -21,3 +21,4 @@ Thumbs.db
 
 # Other
 .env
+data/pihole_state.json
