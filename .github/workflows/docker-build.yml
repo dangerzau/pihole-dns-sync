@@ -27,8 +27,8 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ghcr.io/bob/pihole-dns-sync:latest
+          tags: ghcr.io/dangerzau/pihole-dns-sync:latest
           # optionally tags: |
-          #   ghcr.io/bob/pihole-dns-sync:latest
-          #   ghcr.io/bob/pihole-dns-sync:${{ github.sha }}
+          #   ghcr.io/dangerzau/pihole-dns-sync:latest
+          #   ghcr.io/dangerzau/pihole-dns-sync:${{ github.sha }}
           target: runner    # uncomment if you want the binary image
