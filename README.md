@@ -1,30 +1,21 @@
-📦 pihole-dns-sync
+📦 Pihole-Dns-Sync
 Automated Pi-hole v6 DNS Record Management for Docker Containers
 
-pihole-dns-sync is a lightweight tool that listens for Docker container events and automatically syncs container DNS records with your Pi-hole v6 instance. It supports both Traefik labels and manual container environment variables to manage A and CNAME records dynamically.
+Pihole-Dns-Sync is a lightweight tool that listens for Docker container events and automatically syncs container DNS records with your Pi-hole v6 instance. It supports both Traefik labels and manual container environment variables to manage A and CNAME records dynamically.
 
 ✨ Features
 🐳 Listens to container start/stop events
-
 🔖 Reads Traefik Host() labels or custom environment variables
-
 🛡️ Adds A or CNAME records to Pi-hole v6 automatically
-
 🧹 Removes DNS records when containers stop
-
 🧪 Dry-run mode for safe testing
-
 📈 Exposes Prometheus metrics
-
-💚 Healthcheck HTTP server for monitoring
-
 🔥 Extremely lightweight and fast (Python + Docker SDK)
-
 ⚙️ Environment Variables
 
 Variable	Required	Default	Description
-PIHOLE_URL	✅	—	Full URL (e.g., http://192.168.1.10) or IP address of Pi-hole (must include `/api/` suffix)
-PIHOLE_PASSWORD	✅	—	Pi-hole web interface password (used to obtain a session)
+PIHOLE_URL	✅	—	Full URL (e.g., http://192.168.1.10) or IP address of Pi-hole (must include `/api/` suffix) and can use the docker service name ie http://pihole/api
+PIHOLE_PASSWORD	✅	—	Pi-hole web interface api password (used to obtain a session)
 DEFAULT_DNS_TARGET	❌	—	Default target IP or host if using Traefik mode
 TRAEFIK_WATCH	❌	true	Whether to watch Traefik labels (true) or manual vars (false)
 DRY_RUN	❌	false	If true, no changes are made to Pi-hole (simulates only)
@@ -52,8 +43,8 @@ services:
       - TRAEFIK_WATCH=true
       - DEFAULT_DNS_TARGET=192.168.1.100
       - DRY_RUN=false
-      - RECONCILE_INTERVAL_MINUTES=30   # optional: sync every 30 minutes
-      - SCAN_ON_START=true             # run container scan on startup
+      - RECONCILE_INTERVAL_MINUTES=30   # optional: Re-sync every 30 minutes - Set in minutes - Can be handy if services take a while to come up and got missed during boot
+      - SCAN_ON_START=true             # run container scan on startup - Handy if containers are being missed during a reboot - If you set Pihole-Dns-Sync to be the last container to startup, this option is for you
       - WAIT_FOR=traefik,pihole        # wait for these to report healthy
       - WAIT_TIMEOUT_SECONDS=60        # give up after one minute
     volumes:
@@ -66,8 +57,6 @@ services:
       - 8000:8000
 🔥 Manual Mode (Without Traefik)
 If TRAEFIK_WATCH=false, each container you want to sync must define two environment variables:
-
-
 Container Env Variable	Description
 CONTAINER_HOST	The hostname to register
 TARGET_HOST	The IP address or hostname the record points to
@@ -95,35 +84,22 @@ mapping3=sonarr.example.com,arr.internal    # Creates CNAME record
 - They persist independently of container lifecycle events
 
 🔄 How It Works
+
+Each container you want to have dns records automatically configured needs the to have the the following labels set
+Labels:
+  - "piholeup=true"
+  - "traefik.http.routers.somerouter.rule=Host(`somesubdomain.mydomain.net`)
+
+Without the piholeup=true label pihole-dns-sync will ignore the host records and NOT create dns records automatically.
+
 On container start:
 
 If TRAEFIK_WATCH=true, reads the Host() rule from Traefik label.
-
 If TRAEFIK_WATCH=false, reads CONTAINER_HOST and TARGET_HOST.
-
 Creates either an A record (if target is IP) or a CNAME record (if target is hostname).
-
 On container stop:
-
 Automatically deletes the record from Pi-hole.
 
-📈 Prometheus Metrics
-Available on http://localhost:8000/metrics, includes:
-
-Number of created records
-
-Number of deleted records
-
-API call success/failure counts
-
-💚 Healthcheck
-Simple health endpoint at:
-
-http
-Copy
-Edit
-GET http://localhost:8000/health
-Returns HTTP 200 OK if the service is running.
 
 🔧 Local Development
 Clone and build:
@@ -192,17 +168,6 @@ The container will perform the audit then exit immediately.
 > (`ping`, `curl`, `nc`) so you have basic troubleshooting tools even though the
 > image is otherwise minimal.
 
-🚀 GitHub Actions
-This repository includes a GitHub Actions workflow to automatically:
-
-Build the Docker image
-
-Push to GitHub Container Registry (GHCR) as ghcr.io/dangerzau/pihole-dns-sync:latest
-
-You only need to git push, and everything else is handled automatically.
-
-📜 License
-MIT License
 
 🎯 Notes
 Works best with Pi-hole v6 (which introduced API support for DNS records)
@@ -211,5 +176,6 @@ Designed for homelab setups, media servers, internal apps, and self-hosted servi
 
 📣 Contributing
 Pull requests and suggestions are welcome! Feel free to open an issue if you find a bug or want a feature added.
+
 
 
