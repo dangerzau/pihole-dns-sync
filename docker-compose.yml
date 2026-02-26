@@ -1,20 +1,56 @@
+# ====================================================================
+# =             Services contained in this compose file:             =
+# ====================================================================
+# Updated: 2026-02-25 16:22:00 AEDT+1100
+# pihole-dns-sync - Description
+
 services:
   pihole-dns-sync:
+    # by default this will build the "runtime" image (Python interpreter
+    # inside). to instead build/use the tiny binary-only image you have two
+    # choices:
+    #
+    # 1. build the runner target locally and reference it via image name:
+    #
+    #      docker build --target=runner -t pihole-dns-sync:binary .
+    #
+    #    then drop `build:` and use `image: pihole-dns-sync:binary` below.
+    #
+    # 2. instruct Compose to build the runner target directly:
+    #
+    #    build:
+    #      context: .
+    #      dockerfile: Dockerfile
+    #      target: runner
+    #
+    #    (leaving the rest of the service unchanged)
+    #
+    # example using option 2:
     build:
       context: .  # Current directory where Dockerfile is located
-      dockerfile: Dockerfile  # Explicitly specify the Dockerfile (optional if named 'Dockerfile')
+      dockerfile: Dockerfile  # optional if named 'Dockerfile'
+      target: runner    # <--- build lightweight binary image
     container_name: pihole-dns-sync
+    env_file:
+      - .env
     environment:
-      # - DOCKER_HOST=unix:///var/run/docker.sock
-      - PYTHONUNBUFFERED=1
-      - DEBUG=false
-      - DEFAULT_DNS_TARGET=jf.jimmyc.net
-      - PIHOLE_URL=http://pihole/api/
-      - PIHOLE_PASSWORD=9mh/OrCmBZa+A1s+ct/yODMwoQR3t/HorETu5Yz1lyg=
-      - TRAEFIK_WATCH=true
-    ports:
-      - "8000:8000"  # Exposes port 8000 to the host
+      - STATE_FILE=${STATE:-/data/pihole_state.json}        # optional, pick location
+      - RECONCILE_INTERVAL_MINUTES=${RECONCILE_INTERVAL_MINUTES:-5}
+      - DEBUG=${DEUG:-false}
+      - DEFAULT_DNS_TARGET=${DEFAULT_DNS_TARGET:-Default.target.net}
+      - PIHOLE_URL=${PIHOLE_URL:-http://addressofpiholeinstance/api/}
+      - PIHOLE_PASSWORD=${PIHOLE_PASSWORD:-}  # read from .env or env var, default empty
+      - TRAEFIK_WATCH=${TRAEFIK_WATCH:-true}
+      - SCAN_ON_START=${SCAN_ON_START:-true} # perform a full scan immediately after startup (in addition to periodic runs)
+      - WAIT_FOR=${WAIT_FOR:-traefik,pihole}          # wait for Traefik and Pi-hole
+      - WAIT_TIMEOUT_SECONDS=${WAIT_TIMEOUT_SECONDS:-60}          # timeout after a minute
+      # Global DNS mappings (mapping1 through mapping99)
+      # Format: mapping<N>=sourceaddress,destinationaddress
+      # If destinationaddress is an IP, creates an A record; otherwise creates a CNAME record
+      - mapping1=${MAPPING1:-alwaysmapthis.domain.net,target.domain.net}
+      - mapping2=${MAPPING2:-}  # add more mappings as needed, or leave empty
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro  # To interact with Docker API
+      - ./data:/data 
     restart: unless-stopped
 

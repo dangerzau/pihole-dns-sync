@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 PIHOLE_URL = os.getenv("PIHOLE_URL")
 PIHOLE_PASSWORD = os.getenv("PIHOLE_PASSWORD")
 DEFAULT_DNS_TARGET = os.getenv("DEFAULT_DNS_TARGET")
+# names of containers to wait for before doing work; comma-separated
+WAIT_FOR = [n.strip() for n in os.getenv("WAIT_FOR", "").split(",") if n.strip()]
+# timeout (seconds) for wait loops, 0 means infinite
+WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT_SECONDS", 0))
 
 # Docker client
 docker_client = docker.from_env()
@@ -29,14 +33,57 @@ RETRY_DELAY = int(os.getenv("RETRY_DELAY", 5))  # in seconds
 DEBOUNCE_SECONDS = float(os.getenv("DEBOUNCE_SECONDS", 0.5))
 # Interval for periodic reconciliation (minutes). 0 disables automatic runs.
 RECONCILE_INTERVAL = int(os.getenv("RECONCILE_INTERVAL_MINUTES", 0))
-# If true the service will perform a full container scan immediately after
-# startup (in addition to the reconciliation step). Useful when launching the
-# daemon and you want records to be re‑created even if containers were already
-# running.
+# If true the daemon will perform a full container scan immediately after
+# startup (equivalent to running with `--scan`).  Useful if the service is
+# started when other containers are already running.
 SCAN_ON_START = os.getenv("SCAN_ON_START", "false").lower() in ("1", "true", "yes")
 
 # Persistent state file to store processed records per container (id -> list of [name, target])
 STATE_FILE = os.getenv("STATE_FILE", "pihole_state.json")
+
+
+# -------------------------------------------------------------
+# helper that waits for specified containers' health to become
+# "healthy" using the Docker API.  The user can supply a list via
+# the WAIT_FOR env var.
+# -------------------------------------------------------------
+
+def wait_for_healthy_containers(names: List[str], timeout: int = 0) -> bool:
+    """Block until all given container names report a healthy status.
+
+    If ``timeout`` is non‑zero the function will return False after that
+    many seconds.  Otherwise it loops indefinitely.
+    """
+    if not names:
+        return True
+
+    logger.info(f"Waiting for containers to become healthy: {names} (timeout={timeout}s)")
+    start = time.time()
+    while True:
+        all_ok = True
+        for nm in names:
+            try:
+                cont = docker_client.containers.get(nm)
+                health = cont.attrs.get("State", {}).get("Health", {}).get("Status")
+                if health != "healthy":
+                    all_ok = False
+                    logger.debug(f"{nm} not healthy yet (status={health})")
+                    break
+            except docker.errors.NotFound:
+                all_ok = False
+                logger.debug(f"{nm} not found while waiting for health")
+                break
+            except Exception as e:
+                all_ok = False
+                logger.debug(f"error inspecting {nm}: {e}")
+                break
+        if all_ok:
+            logger.info("All dependencies are healthy")
+            return True
+        if timeout and (time.time() - start) > timeout:
+            logger.warning(f"Timeout waiting for healthy containers: {names}")
+            return False
+        time.sleep(2)
 
 # Map of container_id -> list of (name, target) that we've successfully added
 container_record_map = {}
@@ -60,6 +107,42 @@ recent_events = {}
 
 # Session management constants
 SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", 1500))  # Default 25 minutes (Pi-hole v6 expires at 30 min, refresh with buffer)
+
+# Global DNS mappings from environment variables (mapping1, mapping2, etc.)
+global_dns_mappings: List[Tuple[str, str]] = []
+
+
+def parse_mapping_env_vars() -> List[Tuple[str, str]]:
+    """Parse environment variables matching pattern mapping1, mapping2, ... mapping99.
+    
+    Each variable should have format: mapping1=sourceaddress,destinationaddress
+    For example: mapping1=abs.jimmyc.net,jf.jimmyc.net
+    
+    Returns a list of (sourceaddress, destinationaddress) tuples.
+    If destinationaddress is an IP address, an A record will be created.
+    Otherwise, a CNAME record will be created.
+    """
+    mappings = []
+    for i in range(1, 100):
+        mapping_key = f"mapping{i}"
+        mapping_value = os.getenv(mapping_key)
+        if mapping_value:
+            try:
+                parts = mapping_value.split(",")
+                if len(parts) != 2:
+                    logger.error(f"Invalid format for {mapping_key}='{mapping_value}'. Expected 'sourceaddress,destinationaddress'")
+                    continue
+                source = parts[0].strip()
+                destination = parts[1].strip()
+                if not source or not destination:
+                    logger.error(f"Empty source or destination in {mapping_key}='{mapping_value}'")
+                    continue
+                mappings.append((source, destination))
+                logger.info(f"Loaded global DNS mapping: {source} -> {destination}")
+            except Exception as e:
+                logger.error(f"Failed to parse {mapping_key}='{mapping_value}': {e}")
+    return mappings
+
 
 def get_session_id(force_refresh: bool = False) -> Optional[str]:
     """Authenticate with Pi-hole and retrieve the session ID."""
@@ -591,6 +674,25 @@ def scan_running_containers(session_id: str, force: bool = False) -> None:
         logger.error(f"Error during container scan: {e}")
 
 
+def apply_global_dns_mappings(session_id: str, force: bool = False) -> None:
+    """Apply global DNS mappings from environment variables to Pi-hole.
+    
+    These mappings are not tied to any specific container, so we use a synthetic
+    container_id based on the mapping itself for state tracking purposes.
+    """
+    if not global_dns_mappings:
+        return
+    
+    logger.info(f"Applying {len(global_dns_mappings)} global DNS mapping(s)...")
+    try:
+        for source, destination in global_dns_mappings:
+            # Use a synthetic container_id for global mappings based on the source address
+            synthetic_cid = f"global-mapping-{source}"
+            add_record(source, destination, session_id, container_id=synthetic_cid, force=force)
+    except Exception as e:
+        logger.error(f"Error applying global DNS mappings: {e}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="pihole-dns-sync utility")
     parser.add_argument(
@@ -625,17 +727,26 @@ def periodic_reconcile_thread(session_id: str) -> None:
             try:
                 logger.info("Periodic reconciliation triggered")
                 reconcile_state(session_id)
+                # Also re-apply global mappings during periodic reconciliation
+                apply_global_dns_mappings(session_id)
             except Exception as e:
                 logger.error(f"Periodic reconcile error: {e}")
     logger.info("Periodic reconciliation thread exiting")
 
 
 def main() -> None:
-    global current_session
+    global current_session, global_dns_mappings
     args = parse_args()
 
     try:
         logger.info("Starting pihole-dns-sync...")
+        
+        # Parse global DNS mappings from environment variables
+        global_dns_mappings = parse_mapping_env_vars()
+        
+        # optionally wait for other services (traefik, pihole, etc.)
+        if WAIT_FOR:
+            wait_for_healthy_containers(WAIT_FOR, timeout=WAIT_TIMEOUT)
         # Load persisted state and authenticate
         load_state()
         session_id = get_session_id()
@@ -650,11 +761,20 @@ def main() -> None:
             # scan mode always re‑pushes records to the API so that an external
             # caller can be confident Pi-hole is up to date
             scan_running_containers(session_id, force=True)
+            apply_global_dns_mappings(session_id, force=True)
             return
 
         # Otherwise behave as the normal long‑running daemon
         # Reconcile persisted records into Pi-hole initially
         reconcile_state(session_id)
+
+        # perform an initial scan if requested via environment
+        if SCAN_ON_START:
+            logger.info("SCAN_ON_START enabled; performing initial container scan")
+            scan_running_containers(session_id, force=True)
+        
+        # Apply global DNS mappings at startup
+        apply_global_dns_mappings(session_id, force=True)
 
         # start periodic reconciliation thread if interval configured
         if RECONCILE_INTERVAL > 0:

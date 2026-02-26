@@ -6,8 +6,8 @@ __pycache__/
 
 # Docker
 *.log
-docker-compose.override.yml
-
+*.override.yml
+compose_backups/
 # VSCode or JetBrains IDE settings (optional, safe)
 .vscode/
 .idea/
