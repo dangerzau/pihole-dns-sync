@@ -487,6 +487,8 @@ def add_record(name: str, target: str, session_id: str, container_id: Optional[s
 
     if response and response.status_code in [200, 201, 204]:
         processed_records.add(key)
+        if container_id:
+            add_to_state(container_id, key)
         logger.info(f"Successfully added DNS record: {name} -> {target}")
         return True
     # If the API returned a 400 with a body indicating the item already exists,
